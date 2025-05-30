@@ -1,0 +1,197 @@
+---
+title: "BS 845 Final Project"
+author: "amber (yuanyuan)"
+date: "2025-04-26"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Libraries
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(cluster)
+library(ggthemes)
+library(viridis)
+library(fpc)
+library(mclust)
+```
+
+## Data Preprocessing
+
+```{r}
+df <- read.csv("EHR.csv", stringsAsFactors = FALSE)
+# --- preprocessing ---
+# --- set high_risk label ---
+df$high_risk <- ifelse(df$unitdischargestatus == "Expired", 1, 0)
+
+# --- clean up age fields ---
+df$age <- trimws(df$age)
+df$age[grepl("^[^0-9.]", df$age) | df$age %in% c("", "NA", "None", "Unknown", "90+", NA)] <- NA
+df$age <- as.numeric(df$age)
+
+# --- delete missing row of key values ---
+essential_vars <- c("age", "gender", "ethnicity", "hospitalid", "unitdischargestatus")
+df <- df[complete.cases(df[, essential_vars]), ]
+
+# --- encode all character columns ---
+label_cols <- df %>% select(where(is.character)) %>% colnames()
+df[label_cols] <- lapply(df[label_cols], function(x) as.numeric(as.factor(x)))
+
+# --- feature selection ---
+features <- df %>%
+  select(where(is.numeric)) %>%
+  select(-high_risk, -unitdischargestatus)
+
+# --- missing value filling (using the mean) ---
+features <- as.data.frame(lapply(features, function(x) {
+  ifelse(is.na(x), mean(x, na.rm = TRUE), x)
+}))
+
+# --- standardization ---
+features_scaled <- scale(features)
+```
+
+## PCA
+
+```{r}
+# --- PCA reduces the dimension to 2 dimensions ---
+pca <- prcomp(features_scaled, center = TRUE, scale. = TRUE)
+pca_data <- as.data.frame(pca$x[, 1:2])
+colnames(pca_data) <- c("PC1", "PC2")
+
+# --- view the contribution of principal component features ---
+loadings <- pca$rotation[, 1:2]
+cat("\n PCA Principal component load (first two dimensions)：\n")
+print(round(loadings, 3))
+
+cat("\n PC1 the most influential variable (Top 5)：\n")
+print(sort(abs(loadings[, "PC1"]), decreasing = TRUE)[1:5])
+
+cat("\n PC2 the most influential variable (Top 5)：\n")
+print(sort(abs(loadings[, "PC2"]), decreasing = TRUE)[1:5])
+
+explained_var <- summary(pca)$importance
+cat("\n Explained Variance by Principal Components:\n")
+print(round(explained_var, 3))
+
+# print just the cumulative variance of first 2 PCs
+cum_var_pc2 <- sum(explained_var["Proportion of Variance", 1:2])
+cat("\n Total variance explained by PC1 and PC2:", round(cum_var_pc2 * 100, 2), "%\n")
+
+```
+
+## Elbow Method & Silhouette to select optimal K
+
+```{r}
+wss <- numeric(10)
+sil_scores <- numeric(10)
+
+for (k in 2:10) {
+  km_temp <- kmeans(pca_data, centers = k, nstart = 25)
+  wss[k] <- km_temp$tot.withinss
+  
+  sil <- silhouette(km_temp$cluster, dist(pca_data))
+  sil_scores[k] <- mean(sil[, 3])
+}
+
+# Elbow Plot
+plot(2:10, wss[2:10], type = "b", pch = 19,
+     xlab = "K value", ylab = "SSE",
+     main = "Elbow Method for Optimal K")
+
+# Silhouette Score Plot
+plot(2:10, sil_scores[2:10], type = "b", pch = 19,
+     xlab = "K value", ylab = "average Silhouette score",
+     main = "Silhouette Score for Optimal K")
+
+```
+
+## KMeans cluster(k=3)
+
+```{r}
+set.seed(42)
+k <- 3
+km <- kmeans(pca_data, centers = k, nstart = 25)
+pca_data$cluster <- as.factor(km$cluster)
+
+# --- clustering visualization ---
+custom_colors <- c("#D3D3D3", "#9bbf8a", "#9d84bf")  
+
+ggplot(pca_data, aes(x = PC1, y = PC2, color = cluster)) +
+  geom_point(size = 2, alpha = 0.7) +
+  scale_color_manual(values = custom_colors) +
+  labs(
+    title = "K-Means Clustering of Patients (PCA visualization)",
+    x = "PC1",
+    y = "PC2",
+    color = "Cluster"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(color = "black"),
+    axis.ticks = element_line(color = "black")
+  )
+
+```
+
+## Mortality Rate
+
+```{r}
+# --- analyze the mortality rate ---
+df$cluster <- km$cluster
+df %>%
+  group_by(cluster) %>%
+  summarise(
+    count = n(),
+    mortality_rate = mean(high_risk)
+  )
+# --- Mortality rate barplot by cluster ---
+mortality_summary <- df %>%
+  group_by(cluster) %>%
+  summarise(
+    count = n(),
+    mortality_rate = mean(high_risk)
+  )
+
+ggplot(mortality_summary, aes(x = factor(cluster), y = mortality_rate, fill = factor(cluster))) +
+  geom_col(width = 0.6, alpha = 0.8) +
+  scale_fill_manual(values = custom_colors) +
+  labs(
+    title = "Mortality Rate by Cluster",
+    x = "Cluster",
+    y = "Mortality Rate"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(color = "black"),
+    axis.ticks = element_line(color = "black"),
+    legend.position = "none"
+  )
+
+```
+
+## Model Evaluation
+
+```{r}
+dists <- dist(pca_data[, c("PC1", "PC2")])
+sil <- silhouette(km$cluster, dists)
+avg_sil <- mean(sil[, 3])
+cat("\n average Silhouette Score：", round(avg_sil, 3), "\n")
+
+tbl <- table(df$cluster, df$high_risk)
+cat("\n Contingency table of classes vs deaths, \n")
+print(tbl)
+chi_result <- chisq.test(tbl)
+cat("Chi-Square p-value：", round(chi_result$p.value, 5), "\n")
+
+```
+
